@@ -49,7 +49,9 @@ Outputs (in --output-dir, default ./hvdReport):
     hvd-tagged.ttl
     hvd-valid.ttl
     dashboard/data/compliance_<catalogue_id>.json   (one per catalogue)
+    dashboard/data/datasets_<catalogue_id>.json     (one per catalogue)
     dashboard/data/catalogues.json
+    dashboard/data/reports/<report-type>.csv        (Reports page downloads)
 """
 
 import argparse
@@ -864,6 +866,8 @@ CHECK_DEFS = [
      "Datasets missing dct:description entirely."),
     ("datasets_no_description_en", "Datasets with no English description", "dataset", "recommended", "Art. 3",
      "Datasets missing dct:description with language tag @en."),
+    ("datasets_no_distribution", "Datasets with no distribution", "dataset", "recommended", "Art. 4",
+     "Datasets with no dcat:distribution at all."),
     ("datasets_no_category", "Datasets with no HVD category", "dataset", "mandatory", "Art. 2",
      "Datasets missing r5r:hvdCategory entirely."),
     ("datasets_no_granular_category", "Datasets with no granular HVD category", "dataset", "mandatory", "Art. 2",
@@ -873,6 +877,8 @@ CHECK_DEFS = [
     ("datasets_no_api", "Datasets with no HVD-tagged API", "dataset", "mandatory", "Art. 5",
      "Datasets with no associated HVD-tagged API. Note: not a mandatory issue if the dataset "
      "has a valid HVD bulk download distribution."),
+    ("distributions_total", "Total HVD-tagged distributions", "distribution", "info", "Art. 4",
+     "Total number of HVD-tagged distributions of HVD datasets."),
     ("distributions_no_access_url", "Distributions with no accessURL", "distribution", "mandatory", "Art. 4",
      "HVD-tagged distributions missing dcat:accessURL."),
     ("distributions_no_download_url", "Bulk download distributions with no downloadURL", "distribution", "mandatory", "Art. 4",
@@ -913,7 +919,7 @@ Q_DATASET_FLAGS = PREFIXES + """
 SELECT DISTINCT ?catalog ?country ?dataset
        ?no_title ?has_title_en ?no_description ?has_description_en
        ?has_category ?has_granular_category ?has_distribution
-       ?has_hvd_distribution ?has_api
+       ?has_hvd_distribution ?has_api ?has_access_url ?has_open_licence
 WHERE {
   ?catalog a dcat:Catalog ; dcterms:spatial ?country ; dcat:dataset ?dataset .
   ?dataset a dcat:Dataset ;
@@ -936,7 +942,83 @@ WHERE {
   BIND(EXISTS { ?dataset (dcat:distribution/dcat:accessService)|^dcat:servesDataset ?svc .
                 ?svc a dcat:DataService ;
                      dcatap:applicableLegislation hvd-ir: } AS ?has_api)
+  BIND(EXISTS { ?dataset dcat:distribution ?auDist .
+                ?auDist dcat:accessURL ?au } AS ?has_access_url)
+  BIND(EXISTS {
+      ?dataset dcat:distribution ?olDist .
+      ?olDist dcterms:license ?olic .
+      OPTIONAL { ?olic ?orel ?oeu VALUES ?orel {
+        skos:exactMatch skos:broadMatch owl:sameAs skos:narrowMatch skos:closeMatch rdfs:seeAlso } }
+      FILTER (?olic IN (ccby:, cc0:) || ?oeu IN (ccby:, cc0:))
+    } AS ?has_open_licence)
 }
+"""
+
+# Per-dataset display info for the dashboard's Datasets table (SAMPLE picks
+# one value when a dataset has several titles/identifiers/categories).
+Q_DATASET_INFO = PREFIXES + """
+SELECT ?catalog ?dataset (SAMPLE(?title) AS ?dtitle) (SAMPLE(?identifier) AS ?dident)
+       (SAMPLE(?topName) AS ?dtopcat)
+WHERE {
+  ?catalog a dcat:Catalog ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+  OPTIONAL { ?dataset dcterms:title ?title .
+             FILTER (langMatches(LANG(?title), "en")) }
+  OPTIONAL { ?record foaf:primaryTopic ?dataset ; dcterms:identifier ?identifier . }
+  OPTIONAL {
+    ?dataset dcatap:hvdCategory ?cat .
+    ?cat skos:broader* ?topCat .
+    ?topCat skos:inScheme hvdCategoriesCV: ;
+            skos:prefLabel ?topName .
+    FILTER NOT EXISTS { ?topCat skos:broader ?higher }
+    FILTER (langMatches(LANG(?topName), "en"))
+  }
+}
+GROUP BY ?catalog ?dataset
+"""
+
+# Top-level HVD categories covered per catalogue (for the "categories
+# covered" metric tile).
+Q_CATALOG_TOPCATS = PREFIXES + """
+SELECT DISTINCT ?catalog ?topCat
+WHERE {
+  ?catalog a dcat:Catalog ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: ;
+           dcatap:hvdCategory ?cat .
+  ?cat skos:broader* ?topCat .
+  ?topCat skos:inScheme hvdCategoriesCV: .
+  FILTER NOT EXISTS { ?topCat skos:broader ?higher }
+}
+"""
+
+Q_TOPCATS_TOTAL = PREFIXES + """
+SELECT (COUNT(DISTINCT ?topCat) AS ?n)
+WHERE {
+  ?topCat skos:inScheme hvdCategoriesCV: .
+  FILTER NOT EXISTS { ?topCat skos:broader ?higher }
+}
+"""
+
+# Licences used per catalogue (for the "catalogue licences" report download).
+Q_CATALOGUE_LICENCES = PREFIXES + """
+SELECT DISTINCT ?country ?catalog ?license
+WHERE {
+  ?catalog a dcat:Catalog ; dcterms:spatial ?country ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+  {
+    ?dataset dcat:distribution/dcterms:license ?license .
+  }
+  UNION
+  {
+    ?dataset (dcat:distribution/dcat:accessService)|^dcat:servesDataset ?svc .
+    ?svc a dcat:DataService ;
+         dcterms:license ?license .
+  }
+}
+ORDER BY ?country ?catalog ?license
 """
 
 # One row per HVD-tagged distribution of an HVD dataset.
@@ -1005,9 +1087,11 @@ def catalogue_id_from_iri(iri):
 
 
 def compute_compliance(ds):
-    """Aggregate the flag queries into per-catalogue check counts.
+    """Aggregate the flag queries into per-catalogue check counts plus the
+    per-dataset rows for the dashboard's Datasets table.
 
-    Returns {catalogue_iri: {"country": ..., "counts": {check_id: n}}}.
+    Returns ({catalogue_iri: {"country": ..., "counts": {...},
+              "datasets": [...], "top_categories": set()}}, top_categories_total).
     """
     per_cat = {}
 
@@ -1015,7 +1099,8 @@ def compute_compliance(ds):
         key = str(catalog)
         if key not in per_cat:
             per_cat[key] = {"country": None, "country_name": None,
-                            "counts": {cid: 0 for cid, *_ in CHECK_DEFS}}
+                            "counts": {cid: 0 for cid, *_ in CHECK_DEFS},
+                            "datasets": [], "top_categories": set()}
         return per_cat[key]
 
     log.info("Computing compliance flags per dataset...")
@@ -1028,6 +1113,7 @@ def compute_compliance(ds):
         counts["datasets_no_title_en"] += not _as_bool(row.has_title_en)
         counts["datasets_no_description"] += _as_bool(row.no_description)
         counts["datasets_no_description_en"] += not _as_bool(row.has_description_en)
+        counts["datasets_no_distribution"] += not _as_bool(row.has_distribution)
         counts["datasets_no_category"] += not _as_bool(row.has_category)
         # only flag a non-granular category when a category is present at all;
         # datasets without any category are already counted above
@@ -1036,10 +1122,46 @@ def compute_compliance(ds):
         counts["datasets_no_hvd_distribution"] += (
             _as_bool(row.has_distribution) and not _as_bool(row.has_hvd_distribution))
         counts["datasets_no_api"] += not _as_bool(row.has_api)
+        # the boolean columns of the dashboard's Datasets table (ISSUE_COLUMNS)
+        c["datasets"].append({
+            "uri": str(row.dataset),
+            "checks": {
+                "category": _as_bool(row.has_category),
+                "granular": _as_bool(row.has_granular_category),
+                "titleEn": _as_bool(row.has_title_en),
+                "descEn": _as_bool(row.has_description_en),
+                "distribution": _as_bool(row.has_hvd_distribution),
+                "accessUrl": _as_bool(row.has_access_url),
+                "licence": _as_bool(row.has_open_licence),
+                "api": _as_bool(row.has_api),
+            },
+        })
+
+    log.info("Collecting dataset titles/identifiers/categories...")
+    info = {}
+    for row in ds.query(Q_DATASET_INFO):
+        info[(str(row.catalog), str(row.dataset))] = row
+    for key, entry in per_cat.items():
+        for d in entry["datasets"]:
+            r = info.get((key, d["uri"]))
+            tail = d["uri"].rstrip("/").rsplit("/", 1)[-1]
+            d["name"] = str(r.dtitle) if r is not None and r.dtitle else tail
+            d["id"] = str(r.dident) if r is not None and r.dident else tail
+            d["cat"] = str(r.dtopcat) if r is not None and r.dtopcat else "—"
+        entry["datasets"].sort(key=lambda d: (d["name"].lower(), d["uri"]))
+
+    log.info("Computing top-level category coverage per catalogue...")
+    for row in ds.query(Q_CATALOG_TOPCATS):
+        key = str(row.catalog)
+        if key in per_cat:
+            per_cat[key]["top_categories"].add(str(row.topCat))
+    result = list(ds.query(Q_TOPCATS_TOTAL))
+    top_categories_total = int(result[0][0]) if result and result[0][0] is not None else 0
 
     log.info("Computing compliance flags per distribution...")
     for row in ds.query(Q_DISTRIBUTION_FLAGS):
         counts = cat_entry(row.catalog)["counts"]
+        counts["distributions_total"] += 1
         counts["distributions_no_access_url"] += not _as_bool(row.has_access_url)
         counts["distributions_no_licence"] += not _as_bool(row.has_licence)
         is_bulk = not _as_bool(row.has_hvd_service)
@@ -1065,17 +1187,18 @@ def compute_compliance(ds):
         if key in per_cat:
             per_cat[key]["country_name"] = str(row.countryName)
 
-    return per_cat
+    return per_cat, top_categories_total
 
 
 def write_compliance_files(ds, output_dir, extra_dir=None):
-    """Write compliance_<catalogue_id>.json per catalogue plus a
-    catalogues.json manifest into <output_dir>/dashboard/data (and optionally
-    into extra_dir, e.g. the app checkout's dashboard/data)."""
-    per_cat = compute_compliance(ds)
+    """Write compliance_<catalogue_id>.json and datasets_<catalogue_id>.json
+    per catalogue plus a catalogues.json manifest into
+    <output_dir>/dashboard/data (and optionally into extra_dir, e.g. the app
+    checkout's dashboard/data). Returns the manifest."""
+    per_cat, top_categories_total = compute_compliance(ds)
     if not per_cat:
         log.warning("No catalogues found — skipping compliance JSON files.")
-        return 0
+        return []
 
     data_dir = os.path.join(output_dir, "dashboard", "data")
     dirs = [data_dir] + ([extra_dir] if extra_dir else [])
@@ -1115,13 +1238,28 @@ def write_compliance_files(ds, output_dir, extra_dir=None):
                 "recommended_count": sum(1 for c in checks if c["status"] == "recommended"),
                 "checks_total": len(checks),
                 "checks_passing": sum(1 for c in checks if c["status"] == "pass"),
+                "top_categories_covered": len(entry["top_categories"]),
+                "top_categories_total": top_categories_total,
             },
             "checks": checks,
+        }
+        datasets_doc = {
+            "catalogue": catalogue_iri,
+            "catalogue_id": catalogue_id,
+            "generated": generated,
+            "datasets": [
+                {"name": d["name"], "id": d["id"], "uri": d["uri"],
+                 "cat": d["cat"], "catalogue": catalogue_id, "checks": d["checks"]}
+                for d in entry["datasets"]
+            ],
         }
         for d in dirs:
             with open(os.path.join(d, "compliance_%s.json" % catalogue_id), "w",
                       encoding="utf-8") as f:
                 json.dump(doc, f, indent=2, ensure_ascii=False)
+            with open(os.path.join(d, "datasets_%s.json" % catalogue_id), "w",
+                      encoding="utf-8") as f:
+                json.dump(datasets_doc, f, indent=2, ensure_ascii=False)
 
         manifest.append({
             "catalogue": catalogue_iri,
@@ -1136,9 +1274,64 @@ def write_compliance_files(ds, output_dir, extra_dir=None):
         with open(os.path.join(d, "catalogues.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-    log.info("Wrote %d compliance file(s) + catalogues.json to %s",
+    log.info("Wrote %d compliance + datasets file(s) + catalogues.json to %s",
              len(manifest), " and ".join(dirs))
-    return len(manifest)
+    return manifest
+
+
+# Report types offered by the dashboard's Reports page (the <select> option
+# values in hvd_dashboard.js) mapped to the Phase B CSVs that carry the data.
+REPORT_DOWNLOADS = {
+    "hvd-source-portal": "Q-MS1.csv",
+    "hvd-key-metadata": "Q-MS2-no-filter.csv",
+    "hvd-distributions": "Q-MS4.csv",
+    "hvd-apis": "Q-MS3.csv",
+    "hvd-apis-key": "Q-MS3.csv",
+    "hvd-api-licences": "Q-MS3.csv",
+    "hvd-dist-licences": "Q-MS4.csv",
+}
+
+
+def write_report_downloads(ds, manifest, output_dir, extra_dir=None):
+    """Publish the downloadable reports under dashboard/data/reports/:
+    copies of the Phase B CSVs named after the dashboard's report-type keys,
+    plus two reports generated from the graph/manifest."""
+    import shutil
+
+    dirs = [os.path.join(output_dir, "dashboard", "data", "reports")]
+    if extra_dir:
+        dirs.append(os.path.join(extra_dir, "reports"))
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+
+    for key, src_name in REPORT_DOWNLOADS.items():
+        src = os.path.join(output_dir, src_name)
+        if not os.path.exists(src):
+            log.warning("  reports/%s.csv skipped — %s not found", key, src_name)
+            continue
+        for d in dirs:
+            shutil.copyfile(src, os.path.join(d, key + ".csv"))
+
+    # hvd-per-catalogue.csv from the manifest
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["country", "countryName", "catalogue", "catalogueId", "datasets"])
+    for m in manifest:
+        writer.writerow([m["country"], m["country_name"] or "", m["catalogue"],
+                         m["catalogue_id"], m["total_datasets"]])
+    for d in dirs:
+        with open(os.path.join(d, "hvd-per-catalogue.csv"), "w", encoding="utf-8",
+                  newline="") as f:
+            f.write(out.getvalue())
+
+    # hvd-catalogue-licences.csv from the graph
+    licences_csv = results_to_csv(ds.query(Q_CATALOGUE_LICENCES))
+    for d in dirs:
+        with open(os.path.join(d, "hvd-catalogue-licences.csv"), "wb") as f:
+            f.write(licences_csv)
+
+    log.info("Wrote %d downloadable report(s) to %s",
+             len(REPORT_DOWNLOADS) + 2, " and ".join(dirs))
 
 
 # ---------------------------------------------------------------------------
@@ -1467,7 +1660,8 @@ def main(argv=None):
 
     if not args.skip_compliance:
         try:
-            write_compliance_files(ds, args.output_dir, args.app_data_dir)
+            manifest = write_compliance_files(ds, args.output_dir, args.app_data_dir)
+            write_report_downloads(ds, manifest, args.output_dir, args.app_data_dir)
         except Exception as e:
             log.error("Compliance JSON generation failed: %s", e)
             errors.append(("compliance JSON files", str(e)))
