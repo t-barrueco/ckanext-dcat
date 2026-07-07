@@ -21,11 +21,18 @@ Phase B (local) - run the 11 reporting queries (Q5, Q6, Q7, Q8, Q-MS1..4 and
 variants) against the local graph and save one CSV per query, plus the
 hvd-tagged.ttl / hvd-valid.ttl dumps, and optionally zip everything.
 
+Phase C (local) - compute the per-catalogue compliance checks consumed by the
+HVD reporting dashboard and write one compliance_<catalogue_id>.json per
+catalogue into <output-dir>/dashboard/data/, mirroring the app's layout, plus
+a catalogues.json manifest (catalogue id/IRI, country, dataset count). Copy
+the dashboard/data folder into the app checkout to feed it real data.
+
 Usage:
     pip install rdflib
     python hvd_reporting_etl.py                       # full run
     python hvd_reporting_etl.py --refresh             # ignore the cache
     python hvd_reporting_etl.py --output-dir out --zip report.zip
+    python hvd_reporting_etl.py --app-data-dir ../HVD_REPORTING_TOOL_V2/dashboard/data
 
 Outputs (in --output-dir, default ./hvdReport):
     Q8 - Current numbers of HVDs in countries - without quality checks.csv
@@ -41,11 +48,15 @@ Outputs (in --output-dir, default ./hvdReport):
     Q-MS4.csv
     hvd-tagged.ttl
     hvd-valid.ttl
+    dashboard/data/compliance_<catalogue_id>.json   (one per catalogue)
+    dashboard/data/catalogues.json
 """
 
 import argparse
 import csv
+import datetime
 import io
+import json
 import logging
 import os
 import sys
@@ -265,12 +276,41 @@ WHERE {
 }
 """
 
+# C5/C6: markers for datasets with no title/description in ANY language.
+# C1 only copies the English literals into the local graph, so "missing
+# entirely" can only be checked remotely; these keep the result as one tiny
+# marker triple per offending dataset.
+MISSING_TITLE_FLAG = URIRef("urn:x-hvd-etl:missingTitle")
+MISSING_DESCRIPTION_FLAG = URIRef("urn:x-hvd-etl:missingDescription")
+
+CONSTRUCT_MISSING_TITLE = PREFIX_BLOCK + """
+CONSTRUCT { ?dataset <urn:x-hvd-etl:missingTitle> true }
+WHERE {
+  __SPATIAL__
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+  FILTER NOT EXISTS { ?dataset dcterms:title ?anyTitle }
+}
+"""
+
+CONSTRUCT_MISSING_DESCRIPTION = PREFIX_BLOCK + """
+CONSTRUCT { ?dataset <urn:x-hvd-etl:missingDescription> true }
+WHERE {
+  __SPATIAL__
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+  FILTER NOT EXISTS { ?dataset dcterms:description ?anyDescription }
+}
+"""
+
 CONSTRUCT_STEPS = [
     ("C1  core metadata", CONSTRUCT_CORE),
     ("C2  distributions", CONSTRUCT_DISTRIBUTIONS),
     ("C3a standalone services", CONSTRUCT_STANDALONE_SERVICES),
     ("C3b distribution services", CONSTRUCT_DISTRIBUTION_SERVICES),
     ("C4  licence mappings", CONSTRUCT_LICENSE_MAPPINGS),
+    ("C5  missing-title markers", CONSTRUCT_MISSING_TITLE),
+    ("C6  missing-description markers", CONSTRUCT_MISSING_DESCRIPTION),
 ]
 
 SELECT_COUNTRIES = PREFIX_BLOCK + """
@@ -803,6 +843,305 @@ ALL_QUERIES = [
 ]
 
 # ---------------------------------------------------------------------------
+# Phase C - per-catalogue compliance checks for the reporting dashboard
+#
+# The dashboard (HVD_REPORTING_TOOL_V2) fetches
+#   dashboard/data/compliance_<catalogue_id>.json
+# and reads summary.total_datasets / summary.total_apis plus the counts of
+# the check ids below (see applyComplianceData in hvd_dashboard.js).
+# ---------------------------------------------------------------------------
+
+# (id, label, subject, severity, article, description) - schema and wording
+# follow the example file shipped with the dashboard.
+CHECK_DEFS = [
+    ("datasets_total", "Total HVD-tagged datasets", "dataset", "info", None,
+     "Total number of datasets tagged with the HVD implementing regulation."),
+    ("datasets_no_title", "Datasets with no title", "dataset", "recommended", "Art. 3",
+     "Datasets missing dct:title entirely."),
+    ("datasets_no_title_en", "Datasets with no English title", "dataset", "recommended", "Art. 3",
+     "Datasets missing dct:title with language tag @en."),
+    ("datasets_no_description", "Datasets with no description", "dataset", "recommended", "Art. 3",
+     "Datasets missing dct:description entirely."),
+    ("datasets_no_description_en", "Datasets with no English description", "dataset", "recommended", "Art. 3",
+     "Datasets missing dct:description with language tag @en."),
+    ("datasets_no_category", "Datasets with no HVD category", "dataset", "mandatory", "Art. 2",
+     "Datasets missing r5r:hvdCategory entirely."),
+    ("datasets_no_granular_category", "Datasets with no granular HVD category", "dataset", "mandatory", "Art. 2",
+     "Datasets where the hvdCategory is a top-level category instead of the most granular sub-category."),
+    ("datasets_no_hvd_distribution", "Datasets with no HVD-tagged distribution", "dataset", "mandatory", "Art. 4",
+     "Datasets that have distributions but none are tagged with r5r:applicableLegislation hvd-ir:."),
+    ("datasets_no_api", "Datasets with no HVD-tagged API", "dataset", "mandatory", "Art. 5",
+     "Datasets with no associated HVD-tagged API. Note: not a mandatory issue if the dataset "
+     "has a valid HVD bulk download distribution."),
+    ("distributions_no_access_url", "Distributions with no accessURL", "distribution", "mandatory", "Art. 4",
+     "HVD-tagged distributions missing dcat:accessURL."),
+    ("distributions_no_download_url", "Bulk download distributions with no downloadURL", "distribution", "mandatory", "Art. 4",
+     "HVD-tagged distributions that are bulk downloads (no HVD-tagged accessService) but are "
+     "missing dcat:downloadURL."),
+    ("distributions_no_licence", "Distributions with no licence", "distribution", "recommended", "Art. 4",
+     "HVD-tagged distributions missing dct:license. May not constitute a mandatory issue if the "
+     "dataset is served by an HVD API that provides licence at service level."),
+    ("bulk_downloads_no_eu_licence", "Bulk downloads with no open EU licence or mapping", "distribution", "mandatory", "Art. 4",
+     "HVD bulk download distributions where the licence is not CC-BY 4.0 or CC0 and is not "
+     "mapped to those via skos:exactMatch or equivalent."),
+    ("apis_total", "Total HVD-tagged APIs", "api", "info", "Art. 5",
+     "Total number of HVD-tagged APIs (via distribution accessService or dcat:servesDataset)."),
+    ("apis_no_endpoint_url", "APIs with no endpoint URL", "api", "mandatory", "Art. 5",
+     "HVD-tagged APIs missing dcat:endpointURL."),
+    ("apis_no_contact_point", "APIs with no contact point", "api", "mandatory", "Art. 5",
+     "HVD-tagged APIs missing dcat:contactPoint."),
+    ("apis_no_qos_document", "APIs with no QoS document", "api", "mandatory", "Art. 5",
+     "HVD-tagged APIs missing foaf:page (quality of service document)."),
+    ("apis_no_hvd_category", "APIs with no HVD category", "api", "mandatory", "Art. 5",
+     "HVD-tagged APIs missing r5r:hvdCategory."),
+    ("apis_no_licence", "APIs with no licence", "api", "mandatory", "Art. 5(6)",
+     "HVD-tagged APIs missing dct:license."),
+    ("apis_no_eu_licence", "APIs with no open EU licence or mapping", "api", "mandatory", "Art. 5(6)",
+     "HVD-tagged APIs where the licence is not CC-BY 4.0 or CC0 and is not mapped to those via "
+     "skos:exactMatch or equivalent."),
+]
+
+_OPEN_LICENCE_EXISTS = """EXISTS {
+      %(node)s dcterms:license ?lic_%(tag)s .
+      OPTIONAL { ?lic_%(tag)s ?rel_%(tag)s ?eu_%(tag)s VALUES ?rel_%(tag)s {
+        skos:exactMatch skos:broadMatch owl:sameAs skos:narrowMatch skos:closeMatch rdfs:seeAlso } }
+      FILTER (?lic_%(tag)s IN (ccby:, cc0:) || ?eu_%(tag)s IN (ccby:, cc0:))
+    }"""
+
+# One row per HVD dataset with per-dataset boolean flags.
+Q_DATASET_FLAGS = PREFIXES + """
+SELECT DISTINCT ?catalog ?country ?dataset
+       ?no_title ?has_title_en ?no_description ?has_description_en
+       ?has_category ?has_granular_category ?has_distribution
+       ?has_hvd_distribution ?has_api
+WHERE {
+  ?catalog a dcat:Catalog ; dcterms:spatial ?country ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+
+  BIND(EXISTS { ?dataset <urn:x-hvd-etl:missingTitle> true } AS ?no_title)
+  BIND(EXISTS { ?dataset dcterms:title ?t .
+                FILTER (langMatches(LANG(?t), "en")) } AS ?has_title_en)
+  BIND(EXISTS { ?dataset <urn:x-hvd-etl:missingDescription> true } AS ?no_description)
+  BIND(EXISTS { ?dataset dcterms:description ?d .
+                FILTER (langMatches(LANG(?d), "en")) } AS ?has_description_en)
+  BIND(EXISTS { ?dataset dcatap:hvdCategory ?anyCat } AS ?has_category)
+  BIND(EXISTS { ?dataset dcatap:hvdCategory ?granCat .
+                ?granCat skos:inScheme hvdCategoriesCV: .
+                FILTER NOT EXISTS { ?narrower skos:broader ?granCat }
+              } AS ?has_granular_category)
+  BIND(EXISTS { ?dataset dcat:distribution ?anyDist } AS ?has_distribution)
+  BIND(EXISTS { ?dataset dcat:distribution ?hvdDist .
+                ?hvdDist dcatap:applicableLegislation hvd-ir: } AS ?has_hvd_distribution)
+  BIND(EXISTS { ?dataset (dcat:distribution/dcat:accessService)|^dcat:servesDataset ?svc .
+                ?svc a dcat:DataService ;
+                     dcatap:applicableLegislation hvd-ir: } AS ?has_api)
+}
+"""
+
+# One row per HVD-tagged distribution of an HVD dataset.
+Q_DISTRIBUTION_FLAGS = PREFIXES + """
+SELECT DISTINCT ?catalog ?distribution
+       ?has_access_url ?has_download_url ?has_licence
+       ?has_hvd_service ?has_open_licence
+WHERE {
+  ?catalog a dcat:Catalog ; dcterms:spatial ?country ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: ;
+           dcat:distribution ?distribution .
+  ?distribution a dcat:Distribution ;
+                dcatap:applicableLegislation hvd-ir: .
+
+  BIND(EXISTS { ?distribution dcat:accessURL ?au } AS ?has_access_url)
+  BIND(EXISTS { ?distribution dcat:downloadURL ?du } AS ?has_download_url)
+  BIND(EXISTS { ?distribution dcterms:license ?li } AS ?has_licence)
+  BIND(EXISTS { ?distribution dcat:accessService ?ds_ .
+                ?ds_ dcatap:applicableLegislation hvd-ir: } AS ?has_hvd_service)
+  BIND(""" + _OPEN_LICENCE_EXISTS % {"node": "?distribution", "tag": "d"} + """ AS ?has_open_licence)
+}
+"""
+
+# One row per HVD-tagged API (data service) linked to an HVD dataset.
+Q_SERVICE_FLAGS = PREFIXES + """
+SELECT DISTINCT ?catalog ?service
+       ?has_endpoint_url ?has_contact_point ?has_qos_document
+       ?has_category ?has_licence ?has_open_licence
+WHERE {
+  ?catalog a dcat:Catalog ; dcterms:spatial ?country ; dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+  ?dataset (dcat:distribution/dcat:accessService)|^dcat:servesDataset ?service .
+  ?service a dcat:DataService ;
+           dcatap:applicableLegislation hvd-ir: .
+
+  BIND(EXISTS { ?service dcat:endpointURL ?ep } AS ?has_endpoint_url)
+  BIND(EXISTS { ?service dcat:contactPoint ?cp } AS ?has_contact_point)
+  BIND(EXISTS { ?service foaf:page ?pg } AS ?has_qos_document)
+  BIND(EXISTS { ?service dcatap:hvdCategory ?sc } AS ?has_category)
+  BIND(EXISTS { ?service dcterms:license ?sl } AS ?has_licence)
+  BIND(""" + _OPEN_LICENCE_EXISTS % {"node": "?service", "tag": "s"} + """ AS ?has_open_licence)
+}
+"""
+
+# Catalogue country names, for the catalogues.json manifest.
+Q_CATALOG_COUNTRIES = PREFIXES + """
+SELECT DISTINCT ?catalog ?country ?countryName
+WHERE {
+  ?catalog a dcat:Catalog ; dcterms:spatial ?country .
+  GRAPH countries: {
+    ?country skos:prefLabel ?countryName .
+    FILTER (langMatches(LANG(?countryName), "en"))
+  }
+}
+"""
+
+
+def _as_bool(value):
+    return str(value).lower() == "true"
+
+
+def catalogue_id_from_iri(iri):
+    return str(iri).rstrip("/").rsplit("/", 1)[-1]
+
+
+def compute_compliance(ds):
+    """Aggregate the flag queries into per-catalogue check counts.
+
+    Returns {catalogue_iri: {"country": ..., "counts": {check_id: n}}}.
+    """
+    per_cat = {}
+
+    def cat_entry(catalog):
+        key = str(catalog)
+        if key not in per_cat:
+            per_cat[key] = {"country": None, "country_name": None,
+                            "counts": {cid: 0 for cid, *_ in CHECK_DEFS}}
+        return per_cat[key]
+
+    log.info("Computing compliance flags per dataset...")
+    for row in ds.query(Q_DATASET_FLAGS):
+        c = cat_entry(row.catalog)
+        c["country"] = str(row.country)
+        counts = c["counts"]
+        counts["datasets_total"] += 1
+        counts["datasets_no_title"] += _as_bool(row.no_title)
+        counts["datasets_no_title_en"] += not _as_bool(row.has_title_en)
+        counts["datasets_no_description"] += _as_bool(row.no_description)
+        counts["datasets_no_description_en"] += not _as_bool(row.has_description_en)
+        counts["datasets_no_category"] += not _as_bool(row.has_category)
+        # only flag a non-granular category when a category is present at all;
+        # datasets without any category are already counted above
+        counts["datasets_no_granular_category"] += (
+            _as_bool(row.has_category) and not _as_bool(row.has_granular_category))
+        counts["datasets_no_hvd_distribution"] += (
+            _as_bool(row.has_distribution) and not _as_bool(row.has_hvd_distribution))
+        counts["datasets_no_api"] += not _as_bool(row.has_api)
+
+    log.info("Computing compliance flags per distribution...")
+    for row in ds.query(Q_DISTRIBUTION_FLAGS):
+        counts = cat_entry(row.catalog)["counts"]
+        counts["distributions_no_access_url"] += not _as_bool(row.has_access_url)
+        counts["distributions_no_licence"] += not _as_bool(row.has_licence)
+        is_bulk = not _as_bool(row.has_hvd_service)
+        if is_bulk:
+            counts["distributions_no_download_url"] += not _as_bool(row.has_download_url)
+            counts["bulk_downloads_no_eu_licence"] += (
+                _as_bool(row.has_licence) and not _as_bool(row.has_open_licence))
+
+    log.info("Computing compliance flags per API...")
+    for row in ds.query(Q_SERVICE_FLAGS):
+        counts = cat_entry(row.catalog)["counts"]
+        counts["apis_total"] += 1
+        counts["apis_no_endpoint_url"] += not _as_bool(row.has_endpoint_url)
+        counts["apis_no_contact_point"] += not _as_bool(row.has_contact_point)
+        counts["apis_no_qos_document"] += not _as_bool(row.has_qos_document)
+        counts["apis_no_hvd_category"] += not _as_bool(row.has_category)
+        counts["apis_no_licence"] += not _as_bool(row.has_licence)
+        counts["apis_no_eu_licence"] += (
+            _as_bool(row.has_licence) and not _as_bool(row.has_open_licence))
+
+    for row in ds.query(Q_CATALOG_COUNTRIES):
+        key = str(row.catalog)
+        if key in per_cat:
+            per_cat[key]["country_name"] = str(row.countryName)
+
+    return per_cat
+
+
+def write_compliance_files(ds, output_dir, extra_dir=None):
+    """Write compliance_<catalogue_id>.json per catalogue plus a
+    catalogues.json manifest into <output_dir>/dashboard/data (and optionally
+    into extra_dir, e.g. the app checkout's dashboard/data)."""
+    per_cat = compute_compliance(ds)
+    if not per_cat:
+        log.warning("No catalogues found — skipping compliance JSON files.")
+        return 0
+
+    data_dir = os.path.join(output_dir, "dashboard", "data")
+    dirs = [data_dir] + ([extra_dir] if extra_dir else [])
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+
+    generated = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    manifest = []
+    for catalogue_iri in sorted(per_cat):
+        entry = per_cat[catalogue_iri]
+        counts = entry["counts"]
+        catalogue_id = catalogue_id_from_iri(catalogue_iri)
+
+        checks = []
+        for cid, label, subject, severity, article, description in CHECK_DEFS:
+            count = counts[cid]
+            if severity == "info":
+                status = "info"
+            elif count == 0:
+                status = "pass"
+            else:
+                status = severity
+            checks.append({
+                "id": cid, "label": label, "subject": subject,
+                "severity": severity, "article": article,
+                "description": description, "count": count, "status": status,
+            })
+
+        doc = {
+            "catalogue": catalogue_iri,
+            "catalogue_id": catalogue_id,
+            "generated": generated,
+            "summary": {
+                "total_datasets": counts["datasets_total"],
+                "total_apis": counts["apis_total"],
+                "mandatory_count": sum(1 for c in checks if c["status"] == "mandatory"),
+                "recommended_count": sum(1 for c in checks if c["status"] == "recommended"),
+                "checks_total": len(checks),
+                "checks_passing": sum(1 for c in checks if c["status"] == "pass"),
+            },
+            "checks": checks,
+        }
+        for d in dirs:
+            with open(os.path.join(d, "compliance_%s.json" % catalogue_id), "w",
+                      encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, ensure_ascii=False)
+
+        manifest.append({
+            "catalogue": catalogue_iri,
+            "catalogue_id": catalogue_id,
+            "country": entry["country"],
+            "country_name": entry["country_name"],
+            "total_datasets": counts["datasets_total"],
+        })
+
+    manifest.sort(key=lambda m: ((m["country_name"] or ""), m["catalogue_id"]))
+    for d in dirs:
+        with open(os.path.join(d, "catalogues.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    log.info("Wrote %d compliance file(s) + catalogues.json to %s",
+             len(manifest), " and ".join(dirs))
+    return len(manifest)
+
+
+# ---------------------------------------------------------------------------
 # SPARQL helpers
 # ---------------------------------------------------------------------------
 
@@ -1103,6 +1442,12 @@ def parse_args(argv=None):
                         default=None,
                         help="Also package the output directory as a zip "
                              "(default path if the flag is given alone: hvdReport.zip)")
+    parser.add_argument("--app-data-dir", metavar="DIR", default=None,
+                        help="Also write the compliance_<catalogue_id>.json files "
+                             "directly into this directory (point it at the "
+                             "dashboard/data folder of the HVD reporting app).")
+    parser.add_argument("--skip-compliance", action="store_true",
+                        help="Skip generating the per-catalogue compliance JSON files.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Debug-level logging.")
     return parser.parse_args(argv)
@@ -1119,6 +1464,13 @@ def main(argv=None):
     ds = build_graph(args.cache or None, args.endpoint, args.refresh,
                      args.output_dir)
     errors = run_reporting_queries(ds, args.output_dir)
+
+    if not args.skip_compliance:
+        try:
+            write_compliance_files(ds, args.output_dir, args.app_data_dir)
+        except Exception as e:
+            log.error("Compliance JSON generation failed: %s", e)
+            errors.append(("compliance JSON files", str(e)))
 
     if args.zip:
         package_zip(args.output_dir, args.zip)
