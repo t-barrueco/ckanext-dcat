@@ -325,6 +325,53 @@ WHERE {
 }
 """
 
+SELECT_COUNTRY_CATALOGS = PREFIX_BLOCK + """
+SELECT DISTINCT ?catalog
+WHERE {
+  ?catalog a dcat:Catalog ;
+           dcterms:spatial <__COUNTRY__> ;
+           dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+}
+"""
+
+SELECT_CATALOG_DATASET_COUNT = PREFIX_BLOCK + """
+SELECT (COUNT(DISTINCT ?dataset) AS ?n)
+WHERE {
+  <__CATALOG__> dcat:dataset ?dataset .
+  ?dataset a dcat:Dataset ;
+           dcatap:applicableLegislation hvd-ir: .
+}
+"""
+
+# Dataset batch size for the last-resort sliced fetch of a big catalogue
+SLICE_SIZE = 1000
+
+
+def spatial_for_country(country_iri):
+    return ("?catalog a dcat:Catalog ; "
+            "dcterms:spatial <%s> ; dcat:dataset ?dataset ." % country_iri)
+
+
+def spatial_for_catalog(catalog_iri):
+    return ("BIND(<%s> AS ?catalog) "
+            "?catalog a dcat:Catalog ; dcterms:spatial ?country ; "
+            "dcat:dataset ?dataset ." % catalog_iri)
+
+
+def spatial_for_catalog_slice(catalog_iri, limit, offset):
+    # The sub-select pins the dataset batch, so the surrounding joins only
+    # touch `limit` datasets — cheap enough for the endpoint to answer.
+    return ("BIND(<%s> AS ?catalog) "
+            "?catalog a dcat:Catalog ; dcterms:spatial ?country ; "
+            "dcat:dataset ?dataset . "
+            "{ SELECT DISTINCT ?dataset WHERE { "
+            "<%s> dcat:dataset ?dataset . "
+            "?dataset a dcat:Dataset ; dcatap:applicableLegislation hvd-ir: . } "
+            "ORDER BY ?dataset LIMIT %d OFFSET %d }"
+            % (catalog_iri, catalog_iri, limit, offset))
+
 # ---------------------------------------------------------------------------
 # Phase B - reporting queries (from the LP-ETL pipeline, unchanged)
 # ---------------------------------------------------------------------------
@@ -1402,11 +1449,83 @@ def get_countries(endpoint):
     return [r.strip().strip('"') for r in rows[1:] if r.strip()]
 
 
-def load_hvd_metadata(ds, endpoint):
-    """Run the CONSTRUCT steps: global first, per-country on failure.
+def fetch_construct(query, endpoint, target_graph, attempts=2, wait=15):
+    """Run a CONSTRUCT with retries and parse the result into target_graph.
 
-    Returns a list of "step / country" labels that could not be fetched, so
-    the caller can decide whether the run is complete enough.
+    The endpoint answers 500/504 both for transient load and for genuinely
+    too-heavy queries, so a couple of spaced retries are worth it before the
+    caller splits the query into smaller pieces. Returns the triples added.
+    """
+    before = len(target_graph)
+    for attempt in range(attempts):
+        try:
+            target_graph.parse(io.BytesIO(run_sparql_construct(query, endpoint)),
+                               format="turtle")
+            return len(target_graph) - before
+        except Exception as e:
+            if attempt == attempts - 1:
+                raise
+            log.info("      retry %d/%d in %ds (%s)", attempt + 1, attempts - 1,
+                     wait, e)
+            time.sleep(wait)
+
+
+def load_step_per_catalog(template, country_iri, hvd_graph, endpoint,
+                          failures, label, short):
+    """Country-level fetch failed: try each of the country's catalogues, and
+    slice a catalogue into dataset batches when even that is too heavy."""
+    select = SELECT_COUNTRY_CATALOGS.replace("__COUNTRY__", country_iri)
+    try:
+        rows = run_sparql_select(select, endpoint).decode("utf-8").strip().splitlines()
+        catalogs = [r.strip().strip('"') for r in rows[1:] if r.strip()]
+    except Exception as e:
+        log.error("      could not list catalogues for %s: %s", short, e)
+        failures.append("%s / %s" % (label, short))
+        return
+    for catalog_iri in catalogs:
+        cat_id = catalog_iri.rstrip("/").rsplit("/", 1)[-1]
+        q = template.replace("__SPATIAL__", spatial_for_catalog(catalog_iri))
+        t0 = time.time()
+        try:
+            added = fetch_construct(q, endpoint, hvd_graph)
+            log.info("      [%s] %s: +%s (%.1fs)", short, cat_id,
+                     f"{added:,}", time.time() - t0)
+            time.sleep(1)
+            continue
+        except Exception as e:
+            log.warning("      [%s] %s: FAILED (%s) — slicing into batches of %d",
+                        short, cat_id, e, SLICE_SIZE)
+        try:
+            count_q = SELECT_CATALOG_DATASET_COUNT.replace("__CATALOG__", catalog_iri)
+            rows = run_sparql_select(count_q, endpoint).decode("utf-8").strip().splitlines()
+            total = int(rows[1].strip().strip('"')) if len(rows) > 1 else 0
+            for offset in range(0, total, SLICE_SIZE):
+                q = template.replace(
+                    "__SPATIAL__",
+                    spatial_for_catalog_slice(catalog_iri, SLICE_SIZE, offset))
+                t0 = time.time()
+                added = fetch_construct(q, endpoint, hvd_graph, attempts=3)
+                log.info("        [%s] %s %d-%d/%d: +%s (%.1fs)", short, cat_id,
+                         offset, min(offset + SLICE_SIZE, total), total,
+                         f"{added:,}", time.time() - t0)
+                time.sleep(1)
+        except Exception as e:
+            log.error("      [%s] %s: ERROR %s", short, cat_id, e)
+            failures.append("%s / %s / %s" % (label, short, cat_id))
+        time.sleep(1)
+
+
+def load_hvd_metadata(ds, endpoint):
+    """Run the CONSTRUCT steps against the endpoint, degrading gracefully:
+
+    1. one global query per step;
+    2. per-country on failure (with retries);
+    3. per-catalogue within a failing country;
+    4. per-catalogue in dataset slices of SLICE_SIZE as a last resort.
+
+    Returns the list of "step / country [/ catalogue]" pieces that could not
+    be fetched at any level, so the caller can decide whether the run is
+    complete enough.
     """
     hvd_graph = ds.graph(GRAPH_HVD_DATASETS)
     log.info("Target named graph: %s", GRAPH_HVD_DATASETS)
@@ -1415,14 +1534,12 @@ def load_hvd_metadata(ds, endpoint):
 
     for label, template in CONSTRUCT_STEPS:
         log.info("[%s]", label)
-        before = len(hvd_graph)
         query = template.replace("__SPATIAL__", SPATIAL_GLOBAL)
         t0 = time.time()
         try:
-            hvd_graph.parse(io.BytesIO(run_sparql_construct(query, endpoint)),
-                            format="turtle")
+            added = fetch_construct(query, endpoint, hvd_graph, attempts=1)
             log.info("  global fetch: +%s triples (%.1fs)",
-                     f"{len(hvd_graph) - before:,}", time.time() - t0)
+                     f"{added:,}", time.time() - t0)
         except Exception as e:
             log.warning("  global fetch FAILED (%s) — falling back to per-country fetch", e)
             if country_cache is None:
@@ -1433,19 +1550,17 @@ def load_hvd_metadata(ds, endpoint):
                     country_cache = []
             for i, country_iri in enumerate(country_cache, 1):
                 short = country_iri.split("/")[-1]
-                spatial = ("?catalog a dcat:Catalog ; "
-                           "dcterms:spatial <%s> ; dcat:dataset ?dataset ." % country_iri)
-                q = template.replace("__SPATIAL__", spatial)
+                q = template.replace("__SPATIAL__", spatial_for_country(country_iri))
                 t0 = time.time()
                 try:
-                    b = len(hvd_graph)
-                    hvd_graph.parse(io.BytesIO(run_sparql_construct(q, endpoint)),
-                                    format="turtle")
+                    added = fetch_construct(q, endpoint, hvd_graph)
                     log.info("    [%d/%d] %s: +%s (%.1fs)", i, len(country_cache),
-                             short, f"{len(hvd_graph) - b:,}", time.time() - t0)
+                             short, f"{added:,}", time.time() - t0)
                 except Exception as e2:
-                    log.error("    [%d/%d] %s: ERROR %s", i, len(country_cache), short, e2)
-                    failures.append("%s / %s" % (label, short))
+                    log.warning("    [%d/%d] %s: FAILED (%s) — falling back to per-catalogue fetch",
+                                i, len(country_cache), short, e2)
+                    load_step_per_catalog(template, country_iri, hvd_graph,
+                                          endpoint, failures, label, short)
                 time.sleep(1)
         time.sleep(2)
 
