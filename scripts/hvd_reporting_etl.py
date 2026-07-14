@@ -64,6 +64,7 @@ import os
 import sys
 import time
 import zipfile
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -346,7 +347,7 @@ WHERE {
 """
 
 # Dataset batch size for the last-resort sliced fetch of a big catalogue
-SLICE_SIZE = 1000
+SLICE_SIZE = 500
 
 
 def spatial_for_country(country_iri):
@@ -355,22 +356,27 @@ def spatial_for_country(country_iri):
 
 
 def spatial_for_catalog(catalog_iri):
-    return ("BIND(<%s> AS ?catalog) "
-            "?catalog a dcat:Catalog ; dcterms:spatial ?country ; "
-            "dcat:dataset ?dataset ." % catalog_iri)
+    # The catalogue IRI is inlined into the triple patterns (not BIND-ed):
+    # Virtuoso's planner does not propagate BIND constants, so a BIND-ed
+    # query gets costed like the global one and rejected by the endpoint's
+    # execution-time guard (HTTP 400). VALUES keeps ?catalog bound for the
+    # CONSTRUCT templates that need it.
+    return ("VALUES ?catalog { <%s> } "
+            "<%s> a dcat:Catalog ; dcterms:spatial ?country ; "
+            "dcat:dataset ?dataset ." % (catalog_iri, catalog_iri))
 
 
 def spatial_for_catalog_slice(catalog_iri, limit, offset):
     # The sub-select pins the dataset batch, so the surrounding joins only
     # touch `limit` datasets — cheap enough for the endpoint to answer.
-    return ("BIND(<%s> AS ?catalog) "
-            "?catalog a dcat:Catalog ; dcterms:spatial ?country ; "
-            "dcat:dataset ?dataset . "
-            "{ SELECT DISTINCT ?dataset WHERE { "
+    return ("{ SELECT DISTINCT ?dataset WHERE { "
             "<%s> dcat:dataset ?dataset . "
             "?dataset a dcat:Dataset ; dcatap:applicableLegislation hvd-ir: . } "
-            "ORDER BY ?dataset LIMIT %d OFFSET %d }"
-            % (catalog_iri, catalog_iri, limit, offset))
+            "ORDER BY ?dataset LIMIT %d OFFSET %d } "
+            "VALUES ?catalog { <%s> } "
+            "<%s> a dcat:Catalog ; dcterms:spatial ?country ; "
+            "dcat:dataset ?dataset ."
+            % (catalog_iri, limit, offset, catalog_iri, catalog_iri))
 
 # ---------------------------------------------------------------------------
 # Phase B - reporting queries (from the LP-ETL pipeline, unchanged)
@@ -1386,14 +1392,32 @@ def write_report_downloads(ds, manifest, output_dir, extra_dir=None):
 # ---------------------------------------------------------------------------
 
 
+def _sparql_http_error(e):
+    """Turn an HTTPError into an error that includes the endpoint's message.
+
+    Virtuoso reports *why* it rejected a query in the response body (e.g.
+    'Virtuoso 42000 Error: The estimated execution time exceeds the limit'),
+    which is essential to distinguish cost rejections from real errors.
+    """
+    try:
+        detail = " ".join(e.read(500).decode("utf-8", "replace").split())
+    except Exception:
+        detail = ""
+    msg = "HTTP Error %s: %s" % (e.code, getattr(e, "reason", ""))
+    return RuntimeError(msg + (" — " + detail[:300] if detail else ""))
+
+
 def run_sparql_select(query, endpoint):
     """SPARQL SELECT against the remote endpoint, returns CSV bytes."""
     data = urlencode({"query": query, "format": "text/csv"}).encode("utf-8")
     req = Request(endpoint, data=data, method="POST",
                   headers={"Content-Type": "application/x-www-form-urlencoded",
                            "Accept": "text/csv"})
-    with urlopen(req, timeout=300) as response:
-        return response.read()
+    try:
+        with urlopen(req, timeout=300) as response:
+            return response.read()
+    except HTTPError as e:
+        raise _sparql_http_error(e) from None
 
 
 def run_sparql_construct(query, endpoint):
@@ -1402,8 +1426,11 @@ def run_sparql_construct(query, endpoint):
     req = Request(endpoint, data=data, method="POST",
                   headers={"Content-Type": "application/x-www-form-urlencoded",
                            "Accept": "text/turtle"})
-    with urlopen(req, timeout=300) as response:
-        return response.read()
+    try:
+        with urlopen(req, timeout=300) as response:
+            return response.read()
+    except HTTPError as e:
+        raise _sparql_http_error(e) from None
 
 
 def results_to_csv(results):
