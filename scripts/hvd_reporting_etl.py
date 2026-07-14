@@ -337,17 +337,27 @@ WHERE {
 }
 """
 
-SELECT_CATALOG_DATASET_COUNT = PREFIX_BLOCK + """
-SELECT (COUNT(DISTINCT ?dataset) AS ?n)
+# Dataset IRIs of one catalogue, one keyset page at a time. Keyset (a FILTER
+# on the IRI string) instead of OFFSET, because Virtuoso caps sorted
+# TOP+OFFSET at 10,000 rows (error SR353).
+SELECT_CATALOG_DATASETS = PREFIX_BLOCK + """
+SELECT DISTINCT ?dataset
 WHERE {
   <__CATALOG__> dcat:dataset ?dataset .
   ?dataset a dcat:Dataset ;
            dcatap:applicableLegislation hvd-ir: .
+  FILTER (STR(?dataset) > "__LAST__")
 }
+ORDER BY ?dataset
+LIMIT __PAGE__
 """
 
-# Dataset batch size for the last-resort sliced fetch of a big catalogue
+# Starting/minimum dataset batch size for the last-resort fetch of a big
+# catalogue. Batches halve automatically when the endpoint still rejects
+# them (result-size guard D1CTX: max 50,000 triples per response; gateway
+# time-outs), down to MIN_SLICE.
 SLICE_SIZE = 500
+MIN_SLICE = 50
 
 
 def spatial_for_country(country_iri):
@@ -359,24 +369,22 @@ def spatial_for_catalog(catalog_iri):
     # The catalogue IRI is inlined into the triple patterns (not BIND-ed):
     # Virtuoso's planner does not propagate BIND constants, so a BIND-ed
     # query gets costed like the global one and rejected by the endpoint's
-    # execution-time guard (HTTP 400). VALUES keeps ?catalog bound for the
-    # CONSTRUCT templates that need it.
+    # execution-time guard. VALUES keeps ?catalog bound for the CONSTRUCT
+    # templates that need it.
     return ("VALUES ?catalog { <%s> } "
             "<%s> a dcat:Catalog ; dcterms:spatial ?country ; "
             "dcat:dataset ?dataset ." % (catalog_iri, catalog_iri))
 
 
-def spatial_for_catalog_slice(catalog_iri, limit, offset):
-    # The sub-select pins the dataset batch, so the surrounding joins only
-    # touch `limit` datasets — cheap enough for the endpoint to answer.
-    return ("{ SELECT DISTINCT ?dataset WHERE { "
-            "<%s> dcat:dataset ?dataset . "
-            "?dataset a dcat:Dataset ; dcatap:applicableLegislation hvd-ir: . } "
-            "ORDER BY ?dataset LIMIT %d OFFSET %d } "
-            "VALUES ?catalog { <%s> } "
+def spatial_for_dataset_batch(catalog_iri, dataset_iris):
+    # An explicit VALUES list pins the exact datasets: no sorting, no OFFSET,
+    # and the joins touch only the listed IRIs — the cheapest form the
+    # endpoint can be asked for.
+    values = " ".join("<%s>" % d for d in dataset_iris)
+    return ("VALUES ?catalog { <%s> } "
+            "VALUES ?dataset { %s } "
             "<%s> a dcat:Catalog ; dcterms:spatial ?country ; "
-            "dcat:dataset ?dataset ."
-            % (catalog_iri, limit, offset, catalog_iri, catalog_iri))
+            "dcat:dataset ?dataset ." % (catalog_iri, values, catalog_iri))
 
 # ---------------------------------------------------------------------------
 # Phase B - reporting queries (from the LP-ETL pipeline, unchanged)
@@ -1497,10 +1505,63 @@ def fetch_construct(query, endpoint, target_graph, attempts=2, wait=15):
             time.sleep(wait)
 
 
+def get_catalog_datasets(endpoint, catalog_iri, page=1000):
+    """All HVD dataset IRIs of a catalogue, fetched with keyset pagination
+    (the OFFSET-free cursor Virtuoso's SR353 sort cap forces)."""
+    datasets, last = [], ""
+    while True:
+        q = (SELECT_CATALOG_DATASETS
+             .replace("__CATALOG__", catalog_iri)
+             .replace("__LAST__", last)
+             .replace("__PAGE__", str(page)))
+        rows = run_sparql_select(q, endpoint).decode("utf-8").strip().splitlines()
+        batch = [r.strip().strip('"') for r in rows[1:] if r.strip()]
+        # defensive: drop anything that cannot be safely inlined as <IRI>
+        batch = [d for d in batch
+                 if "<" not in d and ">" not in d and '"' not in d and " " not in d]
+        if not batch:
+            break
+        datasets.extend(batch)
+        last = batch[-1]
+        if len(batch) < page:
+            break
+        time.sleep(1)
+    return datasets
+
+
+def load_step_in_batches(template, catalog_iri, hvd_graph, endpoint, short, cat_id):
+    """Fetch one step for one catalogue in explicit dataset batches, halving
+    the batch size whenever the endpoint still rejects it (result-size guard,
+    execution-time guard or gateway time-out)."""
+    datasets = get_catalog_datasets(endpoint, catalog_iri)
+    if not datasets:
+        log.info("        [%s] %s: no HVD datasets listed", short, cat_id)
+        return
+    i, size = 0, SLICE_SIZE
+    while i < len(datasets):
+        n = min(size, len(datasets) - i)
+        q = template.replace(
+            "__SPATIAL__", spatial_for_dataset_batch(catalog_iri, datasets[i:i + n]))
+        t0 = time.time()
+        try:
+            added = fetch_construct(q, endpoint, hvd_graph)
+            log.info("        [%s] %s %d-%d/%d: +%s (%.1fs)", short, cat_id,
+                     i, i + n, len(datasets), f"{added:,}", time.time() - t0)
+            i += n
+            time.sleep(1)
+        except Exception as e:
+            if size <= MIN_SLICE:
+                raise
+            size = max(MIN_SLICE, size // 2)
+            log.warning("        [%s] %s: batch failed (%s) — halving batch size to %d",
+                        short, cat_id, e, size)
+            time.sleep(2)
+
+
 def load_step_per_catalog(template, country_iri, hvd_graph, endpoint,
                           failures, label, short):
     """Country-level fetch failed: try each of the country's catalogues, and
-    slice a catalogue into dataset batches when even that is too heavy."""
+    fall back to explicit dataset batches when a catalogue is still too big."""
     select = SELECT_COUNTRY_CATALOGS.replace("__COUNTRY__", country_iri)
     try:
         rows = run_sparql_select(select, endpoint).decode("utf-8").strip().splitlines()
@@ -1520,22 +1581,11 @@ def load_step_per_catalog(template, country_iri, hvd_graph, endpoint,
             time.sleep(1)
             continue
         except Exception as e:
-            log.warning("      [%s] %s: FAILED (%s) — slicing into batches of %d",
-                        short, cat_id, e, SLICE_SIZE)
+            log.warning("      [%s] %s: FAILED (%s) — fetching in dataset batches",
+                        short, cat_id, e)
         try:
-            count_q = SELECT_CATALOG_DATASET_COUNT.replace("__CATALOG__", catalog_iri)
-            rows = run_sparql_select(count_q, endpoint).decode("utf-8").strip().splitlines()
-            total = int(rows[1].strip().strip('"')) if len(rows) > 1 else 0
-            for offset in range(0, total, SLICE_SIZE):
-                q = template.replace(
-                    "__SPATIAL__",
-                    spatial_for_catalog_slice(catalog_iri, SLICE_SIZE, offset))
-                t0 = time.time()
-                added = fetch_construct(q, endpoint, hvd_graph, attempts=3)
-                log.info("        [%s] %s %d-%d/%d: +%s (%.1fs)", short, cat_id,
-                         offset, min(offset + SLICE_SIZE, total), total,
-                         f"{added:,}", time.time() - t0)
-                time.sleep(1)
+            load_step_in_batches(template, catalog_iri, hvd_graph, endpoint,
+                                 short, cat_id)
         except Exception as e:
             log.error("      [%s] %s: ERROR %s", short, cat_id, e)
             failures.append("%s / %s / %s" % (label, short, cat_id))
