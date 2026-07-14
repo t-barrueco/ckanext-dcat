@@ -348,7 +348,7 @@ WHERE {
            dcatap:applicableLegislation hvd-ir: .
   FILTER (STR(?dataset) > "__LAST__")
 }
-ORDER BY ?dataset
+ORDER BY STR(?dataset)
 LIMIT __PAGE__
 """
 
@@ -1519,7 +1519,7 @@ def get_catalog_datasets(endpoint, catalog_iri, page=1000):
         # defensive: drop anything that cannot be safely inlined as <IRI>
         batch = [d for d in batch
                  if "<" not in d and ">" not in d and '"' not in d and " " not in d]
-        if not batch:
+        if not batch or batch[-1] <= last:
             break
         datasets.extend(batch)
         last = batch[-1]
