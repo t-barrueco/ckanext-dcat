@@ -386,6 +386,75 @@ def spatial_for_dataset_batch(catalog_iri, dataset_iris):
             "<%s> a dcat:Catalog ; dcterms:spatial ?country ; "
             "dcat:dataset ?dataset ." % (catalog_iri, values, catalog_iri))
 
+
+# The service steps (C3a/C3b) time out at ANY batch size for some catalogues:
+# the reverse join (?service dcat:servesDataset ?dataset) plus the nested
+# OPTIONAL blocks defeats Virtuoso's planner. At batch level they are
+# therefore reduced to minimal SKELETONS (the service<->dataset links only);
+# the service attributes are fetched afterwards by fetch_service_details in
+# cheap subject-position lookups keyed by service IRI.
+C3A_BATCH_TEMPLATE = PREFIX_BLOCK + """
+CONSTRUCT {
+  ?service a dcat:DataService ;
+           dcat:servesDataset ?dataset .
+}
+WHERE {
+  VALUES ?dataset { __DATASETS__ }
+  ?service dcat:servesDataset ?dataset .
+  ?service a dcat:DataService .
+}
+"""
+
+C3B_BATCH_TEMPLATE = PREFIX_BLOCK + """
+CONSTRUCT {
+  ?distribution dcat:accessService ?service .
+  ?service a dcat:DataService .
+}
+WHERE {
+  VALUES ?dataset { __DATASETS__ }
+  ?dataset dcat:distribution ?distribution .
+  ?distribution dcat:accessService ?service .
+  ?service a dcat:DataService .
+}
+"""
+
+# step label -> skeleton template used at dataset-batch level
+BATCH_TEMPLATES = {
+    "C3a standalone services": C3A_BATCH_TEMPLATE,
+    "C3b distribution services": C3B_BATCH_TEMPLATE,
+}
+
+# Details for every data service found in the local graph, in VALUES batches.
+# ?service is always in subject position, so these are pure index lookups.
+CONSTRUCT_SERVICE_DETAILS = PREFIX_BLOCK + """
+CONSTRUCT {
+  ?service dcatap:applicableLegislation ?legislation ;
+           dcatap:hvdCategory ?svcCategory ;
+           dcat:endpointURL ?endpointURL ;
+           dcat:contactPoint ?contactPoint ;
+           dcterms:license ?svcLicense ;
+           foaf:page ?page .
+  ?contactPoint vcard:hasURL ?cpURL ;
+                vcard:hasEmail ?cpEmail .
+}
+WHERE {
+  VALUES ?service { __SERVICES__ }
+  OPTIONAL { ?service dcatap:applicableLegislation ?legislation }
+  OPTIONAL { ?service dcatap:hvdCategory ?svcCategory }
+  OPTIONAL { ?service dcat:endpointURL ?endpointURL }
+  OPTIONAL { ?service dcterms:license ?svcLicense }
+  OPTIONAL { ?service foaf:page ?page }
+  OPTIONAL {
+    ?service dcat:contactPoint ?contactPoint .
+    OPTIONAL { ?contactPoint vcard:hasURL ?cpURL }
+    OPTIONAL { ?contactPoint vcard:hasEmail ?cpEmail }
+  }
+}
+"""
+
+RDF_TYPE = URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+DCAT_DATA_SERVICE = URIRef("http://www.w3.org/ns/dcat#DataService")
+
 # ---------------------------------------------------------------------------
 # Phase B - reporting queries (from the LP-ETL pipeline, unchanged)
 # ---------------------------------------------------------------------------
@@ -1529,19 +1598,27 @@ def get_catalog_datasets(endpoint, catalog_iri, page=1000):
     return datasets
 
 
-def load_step_in_batches(template, catalog_iri, hvd_graph, endpoint, short, cat_id):
+def load_step_in_batches(template, catalog_iri, hvd_graph, endpoint, short,
+                         cat_id, label=None):
     """Fetch one step for one catalogue in explicit dataset batches, halving
     the batch size whenever the endpoint still rejects it (result-size guard,
-    execution-time guard or gateway time-out)."""
+    execution-time guard or gateway time-out). Service steps use their
+    skeleton templates; the attributes come later from fetch_service_details."""
     datasets = get_catalog_datasets(endpoint, catalog_iri)
     if not datasets:
         log.info("        [%s] %s: no HVD datasets listed", short, cat_id)
         return
+    skeleton = BATCH_TEMPLATES.get(label)
     i, size = 0, SLICE_SIZE
     while i < len(datasets):
         n = min(size, len(datasets) - i)
-        q = template.replace(
-            "__SPATIAL__", spatial_for_dataset_batch(catalog_iri, datasets[i:i + n]))
+        batch = datasets[i:i + n]
+        if skeleton:
+            q = skeleton.replace("__DATASETS__",
+                                 " ".join("<%s>" % d for d in batch))
+        else:
+            q = template.replace("__SPATIAL__",
+                                 spatial_for_dataset_batch(catalog_iri, batch))
         t0 = time.time()
         try:
             added = fetch_construct(q, endpoint, hvd_graph)
@@ -1555,6 +1632,43 @@ def load_step_in_batches(template, catalog_iri, hvd_graph, endpoint, short, cat_
             size = max(MIN_SLICE, size // 2)
             log.warning("        [%s] %s: batch failed (%s) — halving batch size to %d",
                         short, cat_id, e, size)
+            time.sleep(2)
+
+
+def fetch_service_details(ds, endpoint, failures):
+    """Fetch the attributes of every data service in the local graph, in
+    VALUES batches with halving. Heals the detail gaps the C3a/C3b skeletons
+    leave behind (and any partially-fetched service from other levels)."""
+    hvd_graph = ds.graph(GRAPH_HVD_DATASETS)
+    services = sorted(
+        str(s) for s in hvd_graph.subjects(RDF_TYPE, DCAT_DATA_SERVICE)
+        if "<" not in str(s) and ">" not in str(s)
+        and '"' not in str(s) and " " not in str(s))
+    if not services:
+        log.info("  no data services in the local graph — nothing to detail")
+        return
+    log.info("  fetching details for %s data service(s)", f"{len(services):,}")
+    i, size = 0, 250
+    while i < len(services):
+        n = min(size, len(services) - i)
+        q = CONSTRUCT_SERVICE_DETAILS.replace(
+            "__SERVICES__", " ".join("<%s>" % s for s in services[i:i + n]))
+        t0 = time.time()
+        try:
+            added = fetch_construct(q, endpoint, hvd_graph)
+            log.info("    services %d-%d/%d: +%s (%.1fs)", i, i + n,
+                     len(services), f"{added:,}", time.time() - t0)
+            i += n
+            time.sleep(1)
+        except Exception as e:
+            if size <= MIN_SLICE:
+                log.error("    services %d-%d: ERROR %s", i, i + n, e)
+                failures.append("C7 service details / %d-%d" % (i, i + n))
+                i += n
+                continue
+            size = max(MIN_SLICE, size // 2)
+            log.warning("    service details batch failed (%s) — halving to %d",
+                        e, size)
             time.sleep(2)
 
 
@@ -1585,7 +1699,7 @@ def load_step_per_catalog(template, country_iri, hvd_graph, endpoint,
                         short, cat_id, e)
         try:
             load_step_in_batches(template, catalog_iri, hvd_graph, endpoint,
-                                 short, cat_id)
+                                 short, cat_id, label)
         except Exception as e:
             log.error("      [%s] %s: ERROR %s", short, cat_id, e)
             failures.append("%s / %s / %s" % (label, short, cat_id))
@@ -1598,7 +1712,10 @@ def load_hvd_metadata(ds, endpoint):
     1. one global query per step;
     2. per-country on failure (with retries);
     3. per-catalogue within a failing country;
-    4. per-catalogue in dataset slices of SLICE_SIZE as a last resort.
+    4. per-catalogue in explicit VALUES dataset batches (starting at
+       SLICE_SIZE, halving down to MIN_SLICE) as a last resort — the service
+       steps use minimal skeletons at this level;
+    5. finally, one details pass per data service (fetch_service_details).
 
     Returns the list of "step / country [/ catalogue]" pieces that could not
     be fetched at any level, so the caller can decide whether the run is
@@ -1640,6 +1757,9 @@ def load_hvd_metadata(ds, endpoint):
                                           endpoint, failures, label, short)
                 time.sleep(1)
         time.sleep(2)
+
+    log.info("[C7  service details]")
+    fetch_service_details(ds, endpoint, failures)
 
     log.info("HVD datasets graph : %s triples", f"{len(hvd_graph):,}")
     log.info("Total in Dataset   : %s triples", f"{len(ds):,}")
