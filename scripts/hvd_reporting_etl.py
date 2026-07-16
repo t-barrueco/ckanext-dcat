@@ -426,6 +426,11 @@ BATCH_TEMPLATES = {
 
 # Details for every data service found in the local graph, in VALUES batches.
 # ?service is always in subject position, so these are pure index lookups.
+# UNION branches, NOT stacked OPTIONALs: OPTIONALs in one group multiply
+# (a service with 20 categories x 10 pages x 5 endpoints explodes into
+# thousands of rows), while UNION branches add. Triples with unbound
+# template variables are simply skipped per solution, so the constructed
+# result is identical.
 CONSTRUCT_SERVICE_DETAILS = PREFIX_BLOCK + """
 CONSTRUCT {
   ?service dcatap:applicableLegislation ?legislation ;
@@ -439,12 +444,17 @@ CONSTRUCT {
 }
 WHERE {
   VALUES ?service { __SERVICES__ }
-  OPTIONAL { ?service dcatap:applicableLegislation ?legislation }
-  OPTIONAL { ?service dcatap:hvdCategory ?svcCategory }
-  OPTIONAL { ?service dcat:endpointURL ?endpointURL }
-  OPTIONAL { ?service dcterms:license ?svcLicense }
-  OPTIONAL { ?service foaf:page ?page }
-  OPTIONAL {
+  {
+    ?service dcatap:applicableLegislation ?legislation .
+  } UNION {
+    ?service dcatap:hvdCategory ?svcCategory .
+  } UNION {
+    ?service dcat:endpointURL ?endpointURL .
+  } UNION {
+    ?service dcterms:license ?svcLicense .
+  } UNION {
+    ?service foaf:page ?page .
+  } UNION {
     ?service dcat:contactPoint ?contactPoint .
     OPTIONAL { ?contactPoint vcard:hasURL ?cpURL }
     OPTIONAL { ?contactPoint vcard:hasEmail ?cpEmail }
